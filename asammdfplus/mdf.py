@@ -18,7 +18,7 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 
-from . import (
+from ._original import (
     MDF,
     MDF3,
     MDF4,
@@ -32,27 +32,22 @@ from . import (
     Signal,
     master_using_raster,
 )
+from ._typing import MDF_SUFFIXES
 from ._utils import (
     get_channel_names_with_device,
     get_channel_names_without_device,
     hijack_channels,
     proxy_function_as_method,
 )
-from .io import convert_mdf_to_dataframe
-from .mda import MDA
+from .io import combine_as_dataframe, from_dataframe
+from .mda import plot
 
 logger = logging.getLogger(__name__)
 
-MDF_SUFFIXES = (".mf4", ".mf3", ".mdf", ".dat")
-_quotes: str = r"['\"]"
-_non_quotes: str = r"[^'\"]"
-MDF_ACCESS_PATTERN = (
-    "mdf" + r"\[" + _quotes + rf"({_non_quotes}+)" + _quotes + r"\]"
-)
-del _quotes, _non_quotes
-
 
 class MDFPlus(MDF):
+    """A subclass of MDF that provides additional functionalities."""
+
     _mdf: MDF3 | MDF4
     name: Path
     channels_db: ChannelsDB
@@ -99,6 +94,14 @@ class MDFPlus(MDF):
         else:
             raise KeyError(f"Cannot delete non-cached key: {key}")
 
+    @override
+    def __contains__(self, key: str) -> bool:
+        return key in self.channel_names
+
+    @override
+    def __enter__(self) -> "MDFPlus":
+        return self.inherit_from_mdf(super().__enter__())
+
     ####################
     # Proxy properties #
     ####################
@@ -107,19 +110,15 @@ class MDFPlus(MDF):
     @override
     @proxy_function_as_method
     def plot(self):
-        return MDA.plot
+        return plot
 
     @property
-    @proxy_function_as_method
-    def convert_mdf_to_dataframe(self):
-        return convert_mdf_to_dataframe
+    def combine_as_dataframe(self):
+        return combine_as_dataframe
 
     @property
-    @proxy_function_as_method
-    def find_engine_starting_points(self):
-        from .cst import find_engine_starting_points
-
-        return find_engine_starting_points
+    def from_dataframe(self):
+        return from_dataframe
 
     ###########
     # Methods #
@@ -166,9 +165,6 @@ class MDFPlus(MDF):
                 else:
                     print(f"- \033[36m{channel_name}\033[0m")
         return names
-
-    def master_using_raster(self, raster: RasterType) -> np.ndarray:
-        return master_using_raster(mdf=self._mdf, raster=raster)
 
     @override
     def to_dataframe(
@@ -356,6 +352,9 @@ class MDFPlus(MDF):
                 self.__cache__[name] = signal
             return signal
 
+    def master_using_raster(self, raster: RasterType) -> np.ndarray:
+        return master_using_raster(mdf=self._mdf, raster=raster)
+
     @override
     def iter_channels(
         self,
@@ -419,56 +418,6 @@ class MDFPlus(MDF):
             if name in channels:
                 new.__cache__[name] = signal
         return new
-
-    @staticmethod
-    def get_lab_measurements(lab_content: str) -> set[str]:
-        """
-        LAB 파일 내용에서 RAMCELL 섹션의 변수명 리스트를 추출하는 함수
-
-        Args:
-            lab_content (str): LAB 파일의 전체 내용
-
-        Returns:
-            set[str]: RAMCELL 변수명 리스트
-
-        Raises:
-            ValueError: 입력이 문자열이 아니거나 RAMCELL 섹션이 없는 경우
-        """
-        # 입력값 타입 검증
-        if not isinstance(lab_content, str):
-            raise ValueError(
-                f"LAB 파일 내용이 문자열이 아닙니다: {lab_content}"
-            )
-        ramcell_section: set[str] = set()
-        reading_ramcell: bool = False
-
-        # 줄 단위로 처리
-        for line in lab_content.splitlines():
-            line: str = line.strip()  # 앞뒤 공백 제거
-
-            # RAMCELL 섹션 시작 확인
-            if line == "[RAMCELL]":
-                reading_ramcell = True
-                continue
-
-            # RAMCELL 섹션 종료 확인 (빈 줄이나 새로운 섹션)
-            elif reading_ramcell and (not line or line.startswith("[")):
-                break
-
-            # RAMCELL 변수 처리
-            if reading_ramcell and line:
-                variable_name: str = line.split(";")[
-                    0
-                ]  # 세미콜론으로 분리하여 변수명만 추출
-                ramcell_section.add(variable_name)
-
-        # RAMCELL 섹션이 없거나 비어있는 경우
-        if not ramcell_section:
-            raise ValueError(
-                "LAB 파일에서 RAMCELL 섹션을 찾을 수 없거나 비어있습니다"
-            )
-
-        return ramcell_section
 
     def get_constant_signal(
         self,
@@ -680,17 +629,59 @@ class MDFPlus(MDF):
                 ]
             return []
 
+    @staticmethod
+    def get_lab_measurements(lab_content: str) -> set[str]:
+        """
+        LAB 파일 내용에서 RAMCELL 섹션의 변수명 리스트를 추출하는 함수
+
+        Args:
+            lab_content (str): LAB 파일의 전체 내용
+
+        Returns:
+            set[str]: RAMCELL 변수명 리스트
+
+        Raises:
+            ValueError: 입력이 문자열이 아니거나 RAMCELL 섹션이 없는 경우
+        """
+        # 입력값 타입 검증
+        if not isinstance(lab_content, str):
+            raise ValueError(
+                f"LAB 파일 내용이 문자열이 아닙니다: {lab_content}"
+            )
+        ramcell_section: set[str] = set()
+        reading_ramcell: bool = False
+
+        # 줄 단위로 처리
+        for line in lab_content.splitlines():
+            line: str = line.strip()  # 앞뒤 공백 제거
+
+            # RAMCELL 섹션 시작 확인
+            if line == "[RAMCELL]":
+                reading_ramcell = True
+                continue
+
+            # RAMCELL 섹션 종료 확인 (빈 줄이나 새로운 섹션)
+            elif reading_ramcell and (not line or line.startswith("[")):
+                break
+
+            # RAMCELL 변수 처리
+            if reading_ramcell and line:
+                variable_name: str = line.split(";")[
+                    0
+                ]  # 세미콜론으로 분리하여 변수명만 추출
+                ramcell_section.add(variable_name)
+
+        # RAMCELL 섹션이 없거나 비어있는 경우
+        if not ramcell_section:
+            raise ValueError(
+                "LAB 파일에서 RAMCELL 섹션을 찾을 수 없거나 비어있습니다"
+            )
+
+        return ramcell_section
+
     ########################################
     # Overrides without funcitonal changes #
     ########################################
-
-    @override
-    def __contains__(self, key: str) -> bool:
-        return key in self.channel_names
-
-    @override
-    def __enter__(self) -> "MDFPlus":
-        return self.inherit_from_mdf(super().__enter__())
 
     @override
     @staticmethod
@@ -783,7 +774,6 @@ class MDFPlus(MDF):
             )
         )
         new.name = self.name
-
         return new
 
     @override

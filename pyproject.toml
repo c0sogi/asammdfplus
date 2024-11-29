@@ -1,15 +1,15 @@
 [tool.poetry]
-name = "asammdf-plus"
-version = "0.1.0"
+name = "asammdfplus"
+version = "8.0.0"
 description = "A wrapper for asammdf with additional features"
 authors = ["c0sogi <dcas@naver.com>"]
 license = "MIT"
 readme = "README.md"
-packages = [{ include = "asammdf_plus" }]
+packages = [{ include = "asammdfplus" }]
 
 [tool.poetry.dependencies]
 python = ">=3.10"
-asammdf = "8.0.0"
+asammdf = ">=8.0.0,<8.1.0"
 numpy = ">=1.20.0,<3"
 pandas = ">=1.5.0,<3"
 matplotlib = ">=3.0.0,<4"

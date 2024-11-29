@@ -1,125 +1,26 @@
 import logging
-import re
-from inspect import signature
 from pathlib import Path
 from typing import (
-    TYPE_CHECKING,
     Any,
-    Final,
-    Hashable,
     Iterable,
     Literal,
     Sequence,
-    TypeGuard,
 )
 
-import numpy as np
 import pandas as pd
-from asammdf import MDF, Signal
 
-from ..pandas.dataframe import Counter, concat_dataframes_with_sequence
-from ..pathlib.utils import get_filepaths
-from ..typings.pathlib import PathOrPaths
-
-if TYPE_CHECKING:
-    from .mdf import MDFPlus
-
-SIG_SIGNS: Final = signature(Signal.__init__).parameters
-EXCLUDED_COLUMNS: Final = ("samples", "timestamps")
-
+from ._original import MDF, Signal
+from ._typing import SIG_SIGNS, PathOrPaths
+from ._utils import (
+    concat_dataframes_with_sequence,
+    df_factory,
+    get_filepaths,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _is_asammdf_object(obj: object) -> bool:
-    """Check if the object is an ASAMMDF object."""
-    return (
-        True
-        if getattr(obj, "__module__", "").startswith("asammdf.")
-        else False
-    )
-
-
-def _is_MDFPlus_instance(mdf: "MDF | MDFPlus") -> TypeGuard["MDFPlus"]:
-    """Check if the MDF object is an MDFPlus object."""
-    return isinstance(mdf, MDF) and hasattr(mdf, "__cache__")
-
-
-def _make_pattern(*names: str) -> re.Pattern[str]:
-    return re.compile(
-        "|".join(
-            (
-                "^" + re.escape(name).replace("\\*", ".*") + "$"
-                for name in names
-            )
-        )
-    )
-
-
-def _filter_names(
-    names: set[str],
-    include: Sequence[str] | None,
-    exclude: Sequence[str] | None,
-) -> list[str]:
-    if include:
-        pattern = _make_pattern(*include)
-        return [name for name in names if pattern.match(name)]
-    elif exclude:
-        pattern = _make_pattern(*exclude)
-        return [name for name in names if not pattern.match(name)]
-    return list(names)
-
-
-def _df_factory(
-    mdf: "MDF | MDFPlus",
-    raster: float | None,
-    include: Sequence[str] | None,
-    exclude: Sequence[str] | None,
-    reduce_memory_usage: bool,
-    allow_asammdf_objects: bool,
-) -> pd.DataFrame:
-    is_mdf_plus: bool = _is_MDFPlus_instance(mdf)
-    channels: list[str] | None = (
-        _filter_names(
-            (
-                mdf.channel_names
-                if is_mdf_plus
-                else set(mdf.channels_db.keys())
-            ),
-            include,
-            exclude,
-        )
-        if include or exclude
-        else None
-    )
-    metadata: dict[Hashable, dict[str, Any]] = {
-        signal.name.split("\\")[0]: {
-            k: v
-            for k, v in signal.__dict__.items()
-            if k in SIG_SIGNS
-            and k not in EXCLUDED_COLUMNS
-            and (allow_asammdf_objects or not _is_asammdf_object(v))
-        }
-        for signal in (
-            mdf.iter_channels() if channels is None else mdf.select(channels)
-        )
-    }
-    df: pd.DataFrame = mdf.to_dataframe(
-        channels, reduce_memory_usage=reduce_memory_usage, raster=raster
-    )
-    if is_mdf_plus:
-        timestamps: np.ndarray = df.index.values
-        for name, signal in mdf.__cache__.items():
-            df.loc[:, name] = mdf.signal_to_series(signal.interp(timestamps))
-    df.columns = Counter.make_unique_strings(
-        (str(col).split("\\")[0] for col in df.columns)
-    )
-    # Update the attributes of the DataFrame
-    df.attrs.update(metadata)
-    return df
-
-
-def convert_mdf_to_dataframe(
+def to_dataframe(
     fpath_or_mdf: str | Path | MDF,
     raster: float | None = 0.1,
     compression_suffix: str = ".xz",
@@ -143,38 +44,37 @@ def convert_mdf_to_dataframe(
         exclude: List of signal names to exclude.
         write_to_disk: Whether to save the DataFrame to disk.
         allow_asammdf_objects: Whether to include ASAMMDF objects in attributes of the DataFrame.
-        prefer_original_df_conversion: Whether to use the original DataFrame factory.
 
     Returns:
         The path to the saved DataFrame.
     """
-    # == Initialize ==
     if include and isinstance(include, str):
         include = (include,)
     elif exclude and isinstance(exclude, str):
         exclude = (exclude,)
 
     if isinstance(fpath_or_mdf, MDF):
-        # MDF 객체가 주어진 경우, 파일 경로를 추출
+        # If an MDF object is given, extract the file path
         fpath = Path(fpath_or_mdf.name)
     else:
-        # 파일 경로가 주어진 경우, Path 객체로 변환
+        # If a file path is given, convert it to a Path object
         fpath = Path(fpath_or_mdf)
 
-    # 압축 파일 확장자 추가
+    # Set the output file path
     out_fpath: Path = fpath.with_suffix(compression_suffix)
 
-    # Ignore existing 조건이 거짓이면서 이미 파일이 존재하는 경우, 파일을 불러와서 반환
     if not ignore_existing and out_fpath.exists():
+        # Load previously saved DataFrame
         logger.info(f"- {fpath_or_mdf} already exists, skipping")
         return pd.read_pickle(out_fpath)
 
+    # Create an MDF object
     if isinstance(fpath_or_mdf, MDF):
-        mdf = fpath_or_mdf
+        mdf: MDF = fpath_or_mdf
     else:
         mdf = MDF(fpath, raise_on_multiple_occurrences=False)
 
-    df: pd.DataFrame = _df_factory(
+    df: pd.DataFrame = df_factory(
         mdf=mdf,
         raster=raster,
         include=include,
@@ -192,8 +92,7 @@ def convert_mdf_to_dataframe(
             "$start_time": mdf.start_time,
         }
     )
-
-    del mdf  # 메모리 해제
+    del mdf
     if write_to_disk:
         df.to_pickle(out_fpath)
         logger.info(
@@ -202,7 +101,7 @@ def convert_mdf_to_dataframe(
     return df
 
 
-def convert_mdfs_to_dataframe(
+def combine_as_dataframe(
     path_or_paths: PathOrPaths,
     ext_or_exts: str | Iterable[str] = (".dat", ".mf4"),
     raster: float | None = 0.1,
@@ -215,7 +114,7 @@ def convert_mdfs_to_dataframe(
     allow_asammdf_objects: bool = False,
     axis: Literal[0, 1] = 0,
     sorted_columns: bool = True,
-    prefer_original_df_conversion: bool | None = None,
+    **kwargs: Any,  # For compatibility
 ) -> pd.DataFrame:
     """Convert MDF files to DataFrames and concatenate them along the specified axis.
 
@@ -239,7 +138,7 @@ def convert_mdfs_to_dataframe(
     """
     return concat_dataframes_with_sequence(
         dfs=[
-            convert_mdf_to_dataframe(
+            to_dataframe(
                 fpath_or_mdf=file_path,
                 raster=raster,
                 compression_suffix=compression_suffix,
@@ -249,7 +148,6 @@ def convert_mdfs_to_dataframe(
                 exclude=exclude,
                 write_to_disk=write_to_disk,
                 allow_asammdf_objects=allow_asammdf_objects,
-                prefer_original_df_conversion=prefer_original_df_conversion,
             )
             for file_path in get_filepaths(
                 path_or_paths=path_or_paths, ext_or_exts=ext_or_exts
@@ -260,11 +158,11 @@ def convert_mdfs_to_dataframe(
     )
 
 
-def read_mdf_from_dataframe(fpath_or_df: str | Path | pd.DataFrame) -> MDF:
+def from_dataframe(fpath_or_df: str | Path | pd.DataFrame) -> MDF:
     """Load DataFrame, ensure unique column names, and save as MDF.
 
     Args:
-        fpath: Path to the DataFrame file.
+        fpath_or_df: Path to the DataFrame file or a DataFrame object.
 
     Returns:
         The MDF object.

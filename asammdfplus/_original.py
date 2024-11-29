@@ -1,7 +1,4 @@
-import logging
-
 # flake8: noqa
-logging.getLogger("canmatrix").addHandler(logging.NullHandler())
 import pandas as pd
 from asammdf import MDF, Signal
 from asammdf.blocks.mdf_v3 import MDF3
@@ -15,5 +12,3 @@ from asammdf.types import (
     InputType,
     RasterType,
 )
-
-from .mdf import MDFPlus, Signal

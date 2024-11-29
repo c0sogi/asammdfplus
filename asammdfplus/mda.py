@@ -1,8 +1,7 @@
 import logging
-from contextlib import contextmanager
 from inspect import signature
 from itertools import cycle
-from typing import Any, Callable, Iterator, Mapping, Sequence, TypeAlias
+from typing import Callable, Iterator, Mapping, Sequence, TypeAlias
 
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
@@ -12,71 +11,206 @@ from asammdf import MDF, Signal
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
-from ._typing import ColorLike, GroupProperty, LineStyle, Package
+from ._typing import (
+    ColorLike,
+    GroupProperty,
+    Groups,
+    LineStyle,
+    Package,
+)
 from ._utils import CaselessDict
 
-logger = logging.getLogger(__name__)
-default_dtype = np.float64
 SignalDict: TypeAlias = CaselessDict[Signal]
+logger = logging.getLogger(__name__)
+
 
 try:
     from matplotlib import colormaps
 except ImportError:
     import matplotlib.cm as colormaps
 
-Groups: TypeAlias = (
-    Mapping[str, Sequence[str]] | Sequence[str | Sequence[str]] | str
-)
 
+def plot(
+    mdf_or_df: MDF | pd.DataFrame,
+    groups: Groups,
+    fig_cols: int = 1,
+    figsize_per_row: tuple[float, float] = (10, 2),
+    dpi: int | None = None,
+    ylims: Mapping[str, tuple[float, float]] | None = None,
+    tickless_groups: Sequence[str] | str | None = None,
+    timestamps_list: list[tuple[float, float]] | None = None,
+    cmap: str = "tab10",
+    title_format: str | None = None,
+    hide_ax_title: bool = True,
+    bit_signal_ratio: float = 0.2,
+    bit_signal_alpha: float = 0.5,
+    bit_signal_ylim: tuple[float, float] = (-0.2, 1.2),
+    spine_offset: float = 50,
+    legend_loc: str = "upper right",
+    line_styles: dict[str, LineStyle] | LineStyle | None = None,
+    colors: dict[str, ColorLike] | None = None,
+    markers: dict[str, str] | str | None = None,
+    markersize: int | None = None,
+    grid: bool = False,
+) -> list[Figure]:
+    """Plot multiple signals in a single figure.
 
-@contextmanager
-def matplotlib_params(
-    figure_figsize: tuple[float, float] | None = None,
-    lines_linewidth: float | None = None,
-    lines_color: str | None = None,
-    lines_linestyle: str | None = None,
-    axes_labelsize: str | None = None,
-    axes_titlesize: str | None = None,
-    axes_titleweight: str | None = None,
-    font_size: float | None = None,
-    font_family: str | None = None,
-    grid: bool | None = None,
-    legend_loc: str | None = None,
-    legend_fontsize: str | None = None,
-    savefig_dpi: float | None = None,
-    savefig_format: str | None = None,
-    xtick_labelsize: str | None = None,
-    ytick_labelsize: str | None = None,
-):
-    """Set multiple matplotlib parameters temporarily."""
-    params: dict[str, Any] = {
-        "figure.figsize": figure_figsize,
-        "lines.linewidth": lines_linewidth,
-        "lines.color": lines_color,
-        "lines.linestyle": lines_linestyle,
-        "axes.labelsize": axes_labelsize,
-        "axes.titlesize": axes_titlesize,
-        "axes.titleweight": axes_titleweight,
-        "font.size": font_size,
-        "font.family": font_family,
-        "axes.grid": grid,
-        "legend.loc": legend_loc,
-        "legend.fontsize": legend_fontsize,
-        "savefig.dpi": savefig_dpi,
-        "savefig.format": savefig_format,
-        "xtick.labelsize": xtick_labelsize,
-        "ytick.labelsize": ytick_labelsize,
-    }
+    Args:
+        mdf_or_df: MDF file or DataFrame.
+        groups: Group of signals to plot.
+        fig_cols: Number of columns in the figure.
+        figsize_per_row: Size of the figure per row.
+        dpi: Dots per inch.
+        ylims: Y-axis limits.
+        tickless_groups: Group names to hide the y-axis ticks.
+        timestamps_list: List of timestamps to plot.
+        cmap: Colormap.
+        title_format: Title format.
+        hide_ax_title: Whether to hide the axis title.
+        bit_signal_ratio: Ratio of the bit signal height.
+        bit_signal_alpha: Alpha value of the bit signal.
+        bit_signal_ylim: Y-axis limits of the bit signal.
+        spine_offset: Offset of the y-axis spine.
+        legend_loc: Location of the legend.
+        line_styles: Line styles.
+        colors: Colors of the signals.
+        markers: Markers of the signals.
+        markersize: Marker size.
+        grid: Whether to show the grid.
 
-    # Filter out None values
-    params = {k: v for k, v in params.items() if v is not None}
+    Returns:
+        list[Figure]: List of figures."""
+    group_properties: Mapping[str, GroupProperty] = _make_group_properties(
+        groups,
+        (
+            ()
+            if tickless_groups is None
+            else (
+                [tickless_groups]
+                if isinstance(tickless_groups, str)
+                else tickless_groups
+            )
+        ),
+    )
+    del groups
 
-    original_params = {key: plt.rcParams[key] for key in params.keys()}
-    try:
-        plt.rcParams.update(params)
-        yield
-    finally:
-        plt.rcParams.update(original_params)
+    get_signal: Callable[[str], Signal] = _get_signal(mdf_or_df)
+    signal_dict: SignalDict = SignalDict(
+        {
+            signal: get_signal(signal)
+            for group_property in group_properties.values()
+            for signal in group_property.signals
+        }
+    )
+    del get_signal
+
+    bit_groups: Sequence[bool] = tuple(
+        all(
+            signal_dict[signal_name].bit_count == 1
+            for signal_name in group_property.signals
+        )
+        for group_property in group_properties.values()
+    )
+    ylims = _make_ylims(signal_dict, group_properties, ylims)
+
+    colormap = (
+        colormaps.get_cmap(  # pyright: ignore[reportAttributeAccessIssue]
+            cmap
+        )
+    )
+    num_plots: int = len(group_properties)
+    num_rows = int(-1 * (num_plots / fig_cols) // 1 * -1)
+    figs: list[Figure] = []
+    for fig_idx, timestamps in enumerate(
+        timestamps_list or _create_empty_timestamps_list(signal_dict)
+    ):
+        fig, axes = plt.subplots(
+            nrows=num_rows,
+            ncols=fig_cols,
+            sharex=True,
+            height_ratios=[
+                bit_signal_ratio if is_bit else 1 for is_bit in bit_groups
+            ][:num_rows],
+            figsize=(
+                int(figsize_per_row[0]),
+                int(figsize_per_row[1] * num_rows),
+            ),
+            dpi=dpi,
+        )
+        axs_flattened: Sequence[Axes] = axes.flatten() if num_plots > 1 else [axes]  # type: ignore
+        color_cycle = cycle(
+            [colormap(i) for i in range(getattr(colormap, "N", 1))]
+        )
+        for ax_idx, (group_name, group_property) in enumerate(
+            group_properties.items()
+        ):
+            # Initialize plotting data structures
+            packages: list[Package] = _prep_packages(
+                group_property.signals,
+                signal_dict,
+                color_cycle,
+                timestamps,
+                colors,
+            )
+
+            # Plot on the same axis with multiple y-axes
+            ax: Axes = _plot_ax(
+                ax=axs_flattened[ax_idx],
+                packages=packages,
+                group_name=group_name,
+                line_styles=line_styles,
+                markers=markers,
+                markersize=markersize,
+                ylims=ylims,
+                bit_signal_alpha=bit_signal_alpha,
+                bit_signal_ylim=bit_signal_ylim,
+                spine_offset=spine_offset,
+                is_all_bit_signal=bit_groups[ax_idx],
+                legend_loc=legend_loc,
+                hide_ax_title=hide_ax_title,
+                tickless=group_property.tickless,
+                grid=grid,
+            )
+
+            # If no signal is plotted, put `No data` in the middle of the subplot
+            if not packages:
+                start, end = timestamps
+                ax.text(
+                    (start + end) / 2,
+                    0.5,
+                    f"No data for {group_name}",
+                    ha="center",
+                    va="center",
+                    color="yellow",
+                    fontsize=20,
+                    weight="bold",
+                    bbox=dict(
+                        facecolor="red",
+                        alpha=0.5,
+                        edgecolor="red",
+                        boxstyle="round,pad=1",
+                    ),
+                )
+
+        # Set x-axis label for the last row
+        for lower_ax in axs_flattened[-fig_cols:]:
+            lower_ax.set_xlabel("Time [s]")
+
+        # Set title for the first row
+        if title_format is not None:
+            fig.suptitle(
+                _format_title_string(
+                    title_string_format=title_format,
+                    idx=fig_idx,
+                    timestamps=timestamps,
+                )
+            )
+
+        # Tighten the layout and append the figure to the list
+        fig.tight_layout()
+        figs.append(fig)
+
+    return figs
 
 
 def _format_title_string(
@@ -364,166 +498,3 @@ def _plot_ax(
             )
             offsets += spine_offset
     return ax
-
-
-class MDA:
-    @staticmethod
-    def plot(
-        mdf_or_df: MDF | pd.DataFrame,
-        groups: Groups,
-        fig_cols: int = 1,
-        figsize_per_row: tuple[float, float] = (10, 2),
-        dpi: int | None = None,
-        ylims: Mapping[str, tuple[float, float]] | None = None,
-        tickless_groups: Sequence[str] | str | None = None,
-        timestamps_list: list[tuple[float, float]] | None = None,
-        cmap: str = "tab10",
-        title_format: str | None = None,
-        hide_ax_title: bool = True,
-        bit_signal_ratio: float = 0.2,
-        bit_signal_alpha: float = 0.5,
-        bit_signal_ylim: tuple[float, float] = (-0.2, 1.2),
-        spine_offset: float = 50,
-        legend_loc: str = "upper right",
-        line_styles: dict[str, LineStyle] | LineStyle | None = None,
-        colors: dict[str, ColorLike] | None = None,
-        markers: dict[str, str] | str | None = None,
-        markersize: int | None = None,
-        grid: bool = False,
-    ) -> list[Figure]:
-        """Get multi-signal figures."""
-        group_properties: Mapping[str, GroupProperty] = (
-            _make_group_properties(
-                groups,
-                (
-                    ()
-                    if tickless_groups is None
-                    else (
-                        [tickless_groups]
-                        if isinstance(tickless_groups, str)
-                        else tickless_groups
-                    )
-                ),
-            )
-        )
-        del groups
-
-        get_signal: Callable[[str], Signal] = _get_signal(mdf_or_df)
-        signal_dict: SignalDict = SignalDict(
-            {
-                signal: get_signal(signal)
-                for group_property in group_properties.values()
-                for signal in group_property.signals
-            }
-        )
-        del get_signal
-
-        bit_groups: Sequence[bool] = tuple(
-            all(
-                signal_dict[signal_name].bit_count == 1
-                for signal_name in group_property.signals
-            )
-            for group_property in group_properties.values()
-        )
-        ylims = _make_ylims(signal_dict, group_properties, ylims)
-
-        colormap = colormaps.get_cmap(  # pyright: ignore[reportAttributeAccessIssue]
-            cmap
-        )
-        num_plots: int = len(group_properties)
-        num_rows = int(-1 * (num_plots / fig_cols) // 1 * -1)
-        figs: list[Figure] = []
-        for fig_idx, timestamps in enumerate(
-            timestamps_list or _create_empty_timestamps_list(signal_dict)
-        ):
-            fig, axes = plt.subplots(
-                nrows=num_rows,
-                ncols=fig_cols,
-                sharex=True,
-                height_ratios=[
-                    bit_signal_ratio if is_bit else 1
-                    for is_bit in bit_groups
-                ][:num_rows],
-                figsize=(
-                    int(figsize_per_row[0]),
-                    int(figsize_per_row[1] * num_rows),
-                ),
-                dpi=dpi,
-            )
-            axs_flattened: Sequence[Axes] = axes.flatten() if num_plots > 1 else [axes]  # type: ignore
-            color_cycle = cycle(
-                [colormap(i) for i in range(getattr(colormap, "N", 1))]
-            )
-            for ax_idx, (group_name, group_property) in enumerate(
-                group_properties.items()
-            ):
-                # Initialize plotting data structures
-                packages: list[Package] = _prep_packages(
-                    group_property.signals,
-                    signal_dict,
-                    color_cycle,
-                    timestamps,
-                    colors,
-                )
-
-                # Plot on the same axis with multiple y-axes
-                ax: Axes = _plot_ax(
-                    ax=axs_flattened[ax_idx],
-                    packages=packages,
-                    group_name=group_name,
-                    line_styles=line_styles,
-                    markers=markers,
-                    markersize=markersize,
-                    ylims=ylims,
-                    bit_signal_alpha=bit_signal_alpha,
-                    bit_signal_ylim=bit_signal_ylim,
-                    spine_offset=spine_offset,
-                    is_all_bit_signal=bit_groups[ax_idx],
-                    legend_loc=legend_loc,
-                    hide_ax_title=hide_ax_title,
-                    tickless=group_property.tickless,
-                    grid=grid,
-                )
-
-                # If no signal is plotted, put `No data` in the middle of the subplot
-                if not packages:
-                    start, end = timestamps
-                    ax.text(
-                        (start + end) / 2,
-                        0.5,
-                        f"No data for {group_name}",
-                        ha="center",
-                        va="center",
-                        color="yellow",
-                        fontsize=20,
-                        weight="bold",
-                        bbox=dict(
-                            facecolor="red",
-                            alpha=0.5,
-                            edgecolor="red",
-                            boxstyle="round,pad=1",
-                        ),
-                    )
-
-            # Set x-axis label for the last row
-            for lower_ax in axs_flattened[-fig_cols:]:
-                lower_ax.set_xlabel("Time [s]")
-
-            # Set title for the first row
-            if title_format is not None:
-                fig.suptitle(
-                    _format_title_string(
-                        title_string_format=title_format,
-                        idx=fig_idx,
-                        timestamps=timestamps,
-                    )
-                )
-
-            # Tighten the layout and append the figure to the list
-            fig.tight_layout()
-            figs.append(fig)
-
-        return figs
-
-
-get_multi_signal_figures = MDA.plot
