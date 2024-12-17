@@ -329,7 +329,7 @@ def df_factory(
     if is_mdf_plus:
         timestamps: np.ndarray = df.index.values
         for name, signal in mdf.__cache__.items():
-            df.loc[:, name] = mdf.signal_to_series(signal.interp(timestamps))
+            df[name] = mdf.signal_to_series(signal.interp(timestamps))
     df.columns = Counter.make_unique_strings(
         (str(col).split("\\")[0] for col in df.columns)
     )

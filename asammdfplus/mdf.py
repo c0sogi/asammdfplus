@@ -222,7 +222,7 @@ class MDFPlus(MDF):
             if cached_signals:
                 master: np.ndarray = df.index.to_numpy()
                 for name, signal in cached_signals.items():
-                    df.loc[:, name] = signal.interp(master).samples
+                    df[name] = np.asarray(signal.interp(master).samples)
         else:
             # If there are constraints and all channels are cached,
             # just interpolate the cached signals to the timestamps of the master signal.
@@ -255,7 +255,7 @@ class MDFPlus(MDF):
             master = master[idx]
             df = pd.DataFrame(index=master)
             for name, signal in cached_signals.items():
-                df.loc[:, name] = signal.interp(master).samples
+                df[name] = np.asarray(signal.interp(master).samples)
 
         return df
 

@@ -245,7 +245,7 @@ def _prep_packages(
             Package(
                 name=signal_name,
                 timestamps=signal.timestamps,
-                samples=signal.samples,
+                samples=np.asarray(signal.samples),
                 label=f"{signal_name}\n({str(signal.unit)})",
                 color=mcolors.to_rgba(color),
             )
@@ -328,7 +328,7 @@ def _set_twinax_properties(
             package.timestamps,
             0,
             package.samples,
-            where=(package.samples > 0).tolist(),
+            where=(package.samples > 0).ravel().tolist(),
             color=package.color,
             alpha=bit_signal_alpha,
         )
@@ -397,11 +397,11 @@ def _make_ylims(
         else:
             # If the same range group is not defined, use the min and max of all signals in the group
             min_value = min(
-                signal_dict[name].samples.min()
+                np.asarray(signal_dict[name].samples).min()
                 for name in group_property.signals
             )
             max_value = max(
-                signal_dict[name].samples.max()
+                np.asarray(signal_dict[name].samples).max()
                 for name in group_property.signals
             )
             for signal_name in group_property.signals:
@@ -475,7 +475,7 @@ def _plot_ax(
                     package.timestamps,
                     0,
                     package.samples,
-                    where=(package.samples > 0).tolist(),
+                    where=(package.samples > 0).ravel().tolist(),
                     color=package.color,
                     alpha=bit_signal_alpha,
                 )
