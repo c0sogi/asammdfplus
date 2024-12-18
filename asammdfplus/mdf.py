@@ -589,6 +589,7 @@ class MDFPlus(MDF):
         else:
             mask = mask.ffill().fillna(False)
 
+        mask = mask.astype(bool)
         if as_int:
             # 위치 기반 인덱스 사용
             positions = range(len(mask))
