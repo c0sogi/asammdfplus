@@ -1,16 +1,28 @@
 import logging
 from inspect import signature
 from itertools import cycle
-from typing import Callable, Iterator, Mapping, Sequence, TypeAlias
+from pathlib import Path
+from typing import (
+    Callable,
+    Iterator,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    TypeAlias,
+    TypedDict,
+    cast,
+)
 
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from asammdf import MDF, Signal
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from matplotlib.gridspec import GridSpec
 
+from ._original import MDF, Signal
 from ._typing import (
     ColorLike,
     GroupProperty,
@@ -28,6 +40,452 @@ try:
     from matplotlib import colormaps
 except ImportError:
     import matplotlib.cm as colormaps
+
+
+class PlotSettings(TypedDict, total=False):
+    vars: list[str]
+    ylim: tuple[float, float]
+    show_legend: bool
+
+
+class CSTPlotConfig(TypedDict):
+    engine_speed_col: str
+    batt_vol_col: str
+    raster: float
+    fig_size: tuple[float, float]
+    show_plot: bool
+    grid: bool
+    xlim: Optional[tuple[float, float]]
+    legend_location: str
+    start_offset: float
+    mdf_dict: dict[str, MDF | str]
+    color_map: dict[str, str]
+    plots_config: dict[str, PlotSettings]
+    signal_time_options: Optional[
+        dict[str, list[tuple[Literal["relative", "absolute"], float]]]
+    ]
+
+
+def find_engine_starting_points(
+    df_or_mdf: MDF | pd.DataFrame,
+    engine_speed_col: str,
+    batt_vol_col: str,
+    debounce_patience: float = 0.5,
+    start_patience: float = 5.0,
+    battery_drop_patience: float = 1.0,
+    engine_lower_threshold: float = 250.0,
+    engine_upper_threshold: float = 1000.0,
+    predicate: Callable[[float, float], bool] | None = None,
+    visualize: bool = False,
+) -> list[tuple[float, float]]:
+    """Find the engine starting points based on the given conditions."""
+    if isinstance(df_or_mdf, pd.DataFrame):
+        batt_vol: pd.Series = df_or_mdf[batt_vol_col]
+        engine_speed: pd.Series = df_or_mdf[engine_speed_col]
+    else:
+        batt_vol_signal: Signal = df_or_mdf.get(batt_vol_col)
+        engine_speed_signal: Signal = df_or_mdf.get(engine_speed_col)
+
+        batt_vol: pd.Series = pd.Series(
+            batt_vol_signal.samples,
+            index=batt_vol_signal.timestamps,
+            name=batt_vol_col,
+        )
+        engine_speed: pd.Series = pd.Series(
+            engine_speed_signal.samples,
+            index=engine_speed_signal.timestamps,
+            name=engine_speed_col,
+        )
+
+    batt_vol_diff: pd.Series = batt_vol.diff(1)
+    is_low_speed: pd.Series = engine_speed < engine_lower_threshold
+    is_high_speed: pd.Series = engine_speed > engine_upper_threshold
+
+    # Calculate the indices where the engine speed crosses the low speed threshold
+    low_edges: list[float] = [
+        float(f)
+        for f in engine_speed[
+            ~is_low_speed
+            & is_low_speed.shift(1, fill_value=is_low_speed.iloc[0])
+        ].index.to_list()
+    ]
+    high_edges: list[float] = [
+        float(f)
+        for f in engine_speed[
+            is_high_speed
+            & ~is_high_speed.shift(1, fill_value=is_high_speed.iloc[0])
+        ].index.to_list()
+    ]
+
+    # Implement a debouncing mechanism
+    filtered_ref_edges: list[float] = []
+    previous_edge: float | None = None
+    for edge in low_edges:
+        if (
+            previous_edge is None
+            or (edge - previous_edge) > debounce_patience
+        ):
+            filtered_ref_edges.append(edge)
+            previous_edge = edge
+
+    # Find the actual start points based on battery voltage drop
+    actual_start_points: list[float] = []
+    for ref_edge in filtered_ref_edges:
+        start_index: float = max(0, ref_edge - battery_drop_patience)
+        end_index: float = ref_edge
+        if predicate is not None and not predicate(start_index, end_index):
+            continue
+        search_window: pd.Series = batt_vol_diff[
+            (batt_vol_diff.index >= start_index)
+            & (batt_vol_diff.index <= end_index)
+        ]
+        if not search_window.empty:
+            min_point = float(search_window.idxmin())
+            actual_start_points.append(min_point)
+
+    timestamps: list[tuple[float, float]] = []
+    min_high_edge: float = float("inf")
+    closest_high_edge: float | None
+    for start_point in reversed(actual_start_points):
+        closest_high_edge = None
+        for high_edge in high_edges:
+            if (
+                high_edge > start_point
+                and high_edge <= start_point + start_patience
+            ):
+                if high_edge < min_high_edge:
+                    closest_high_edge = high_edge
+                break
+
+        if closest_high_edge is not None:
+            min_high_edge = min(min_high_edge, closest_high_edge)
+            timestamps.append((start_point, closest_high_edge))
+    timestamps = sorted(timestamps, key=lambda x: x[0])
+
+    # Plot vertical lines at success and fail end points
+    if visualize:
+        fig, ax = plt.subplots(nrows=3, ncols=1, sharex=True)
+        ax = cast(np.ndarray, ax)
+        ax[0].plot(engine_speed, label="Engine Speed", color="blue")
+        ax[1].plot(batt_vol, label="Battery Voltage", color="orange")
+        ax[2].plot(
+            batt_vol_diff, label="Battery Voltage Diff", color="darkorange"
+        )
+        ax[0].vlines(
+            [start for start, end in timestamps],
+            ymin=engine_speed.min(),
+            ymax=engine_speed.max(),
+            color="green",
+            linestyle="--",
+        )
+        ax[0].vlines(
+            [end for start, end in timestamps],
+            ymin=engine_speed.min(),
+            ymax=engine_speed.max(),
+            color="red",
+            linestyle="--",
+        )
+        for a in ax:
+            a.legend()
+        plt.show()
+    return timestamps
+
+
+def plot_cst(cst_plot_config: CSTPlotConfig) -> tuple[Figure, list[Axes]]:
+
+    engine_speed_col = cst_plot_config["engine_speed_col"]
+    batt_vol_col = cst_plot_config["batt_vol_col"]
+    raster = cst_plot_config["raster"]
+    fig_size = cst_plot_config["fig_size"]
+    show_plot = cst_plot_config["show_plot"]
+    global_grid = cst_plot_config["grid"]
+    global_xlim = cst_plot_config["xlim"]
+    legend_location = cst_plot_config["legend_location"]
+    start_offset = cst_plot_config["start_offset"]
+
+    mdf_dict = cst_plot_config["mdf_dict"]
+    color_map_config = cst_plot_config["color_map"]
+    plots_config = cst_plot_config["plots_config"]
+    signal_time_options = cst_plot_config["signal_time_options"]
+
+    # 필요한 변수 수집
+    needed_vars: set[str] = set()
+    for plot_config in plots_config.values():
+        for var in plot_config.get("vars", []):
+            needed_vars.add(var)
+
+    df_dict: dict[str, pd.DataFrame] = {}
+    start_times: dict[str, float] = {}
+    file_names: dict[str, str] = {}
+
+    # MDF -> DataFrame 변환 및 엔진 스타트 포인트 계산
+    for name, mdf in mdf_dict.items():
+        if not isinstance(mdf, MDF):
+            mdf = MDF(mdf)
+        existing_vars = [v for v in needed_vars if v in mdf]
+        if not existing_vars:
+            # 필요한 변수가 하나도 없는 경우 빈 DataFrame
+            df_original = pd.DataFrame()
+        else:
+            df_original = mdf.to_dataframe(existing_vars, raster=raster)
+
+        df_original = df_original.sort_index()
+
+        start_points: list[tuple[float, float]] = (
+            find_engine_starting_points(
+                df_or_mdf=mdf,
+                engine_speed_col=engine_speed_col,
+                batt_vol_col=batt_vol_col,
+                visualize=False,
+            )
+        )
+        if start_points:
+            start_time, end_time = start_points[0]
+        else:
+            start_time = (
+                df_original.index.min() if not df_original.empty else 0.0
+            )
+
+        df = df_original.copy()
+        df.index = df.index - start_time + start_offset
+
+        df_dict[name] = df
+        start_times[name] = start_time
+
+        f_name = (
+            Path(mdf.name).stem if hasattr(mdf, "name") else f"{name} Data"
+        )
+        file_names[name] = f_name
+
+    # 바이너리 플롯 판별
+    binary_plots: dict[str, bool] = {}
+    for plot_title, plot_config in plots_config.items():
+        vars_list = plot_config.get("vars", [])
+        # data_combined를 리스트로 관리 후 empty 아닌 것만 concat
+        non_empty_series: list[pd.Series] = []
+        for source_name, df in df_dict.items():
+            for var in vars_list:
+                if var in df.columns:
+                    s = df[var].dropna()
+                    if not s.empty:
+                        non_empty_series.append(s)
+
+        if non_empty_series:
+            data_combined = pd.concat(non_empty_series)
+            unique_vals = data_combined.unique()
+            if set(unique_vals).issubset({0, 1}):
+                binary_plots[plot_title] = True
+            else:
+                binary_plots[plot_title] = False
+        else:
+            binary_plots[plot_title] = False
+
+    # 높이 비율 결정
+    height_ratios = []
+    for plot_title in plots_config:
+        if binary_plots.get(plot_title, False):
+            height_ratios.append(1)
+        else:
+            height_ratios.append(3)
+
+    # figure 생성 시 constrained_layout 사용
+    fig = plt.figure(figsize=fig_size, constrained_layout=True)
+    gs = GridSpec(
+        len(plots_config), 1, height_ratios=height_ratios, hspace=0.5
+    )
+    axes: list[Axes] = []
+    shared_ax = None
+
+    for i in range(len(plots_config)):
+        if i == 0:
+            ax = fig.add_subplot(gs[i, 0])
+            shared_ax = ax
+        else:
+            ax = fig.add_subplot(gs[i, 0], sharex=shared_ax)
+        axes.append(ax)
+
+    if global_grid:
+        for ax in axes:
+            ax.grid(True)
+
+    if global_xlim and shared_ax is not None:
+        shared_ax.set_xlim(global_xlim)
+
+    # 색상 매핑
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    given_color_map = color_map_config.copy()
+    for i, name in enumerate(mdf_dict.keys()):
+        if name not in given_color_map:
+            given_color_map[name] = colors[i % len(colors)]
+    final_color_map = given_color_map
+
+    # Plot 그리기
+    for i, (plot_title, plot_config) in enumerate(plots_config.items()):
+        vars_list = plot_config.get("vars", [])
+        ylim = plot_config.get("ylim", None)
+        show_legend = plot_config.get("show_legend", True)
+
+        axes[i].set_title(plot_title)
+        data_plotted = False
+
+        # 각 plot에 대해 vars 리스트에서 첫 번째로 유효한 신호 하나만 선택해서 그리기
+        for name, df in df_dict.items():
+            # 순서대로 신호 탐색
+            selected_var: Optional[str] = None
+            for var_candidate in vars_list:
+                if (
+                    var_candidate in df.columns
+                    and not (
+                        numeric_series := df[var_candidate].dropna()
+                    ).empty
+                    and pd.api.types.is_numeric_dtype(numeric_series)
+                ):
+                    selected_var = var_candidate
+                    break
+
+            if selected_var:
+                df[selected_var].plot.line(
+                    ax=axes[i],
+                    label=f"{name}: {selected_var}",
+                    color=final_color_map[name],
+                    ylim=ylim,  # type: ignore
+                    legend=False,
+                )
+                data_plotted = True
+
+                # 바이너리 플롯인 경우 fill_between 처리
+                if binary_plots.get(plot_title, False):
+                    axes[i].set_ylim(-0.2, 1.2)
+                    axes[i].fill_between(
+                        df.index,
+                        0,
+                        df[selected_var],
+                        step="pre",
+                        alpha=0.3,
+                        color=final_color_map[name],
+                    )
+
+        if not data_plotted:
+            axes[i].text(
+                0.5,
+                0.5,
+                "No Signal",
+                horizontalalignment="center",
+                verticalalignment="center",
+                transform=axes[i].transAxes,
+                fontsize="small",
+                color="red",
+            )
+            axes[i].set_xticks([])
+            axes[i].set_yticks([])
+
+        if ylim and not binary_plots.get(plot_title, False):
+            axes[i].set_ylim(ylim)
+
+        if show_legend and data_plotted:
+            legend = axes[i].legend(loc=legend_location)
+            if legend:
+                legend.get_frame().set_facecolor("none")
+
+        # signal_time_options 처리
+        if signal_time_options:
+            for source_name, options in signal_time_options.items():
+                if source_name not in df_dict:
+                    # Unknown source, skip
+                    continue
+
+                source_df = df_dict[source_name]
+                # 여기서도 plot할 때 사용한 var를 찾아야 함
+                # 마찬가지로 vars_list 순서대로 탐색
+                var_for_annot = None
+                for var_candidate in vars_list:
+                    if var_candidate not in source_df.columns:
+                        continue
+
+                    numeric_series = pd.to_numeric(
+                        source_df[var_candidate], errors="coerce"
+                    )
+                    if (~numeric_series.isna()).any():
+                        source_df[var_candidate] = (
+                            numeric_series.ffill().bfill()
+                        )
+                        var_for_annot = var_candidate
+                        break
+
+                if not var_for_annot:
+                    continue
+
+                start_time_original = start_times[source_name]
+                color = final_color_map[source_name]
+
+                for mode, time_value in options:
+                    if mode == "relative":
+                        target_time = time_value
+                    elif mode == "absolute":
+                        target_time = (
+                            time_value - start_time_original + start_offset
+                        )
+                    else:
+                        # Unknown mode, skip
+                        continue
+
+                    if (
+                        not source_df.empty
+                        and var_for_annot in source_df.columns
+                        and not source_df[var_for_annot].dropna().empty
+                    ):
+                        try:
+                            time_diff = np.abs(source_df.index - target_time)
+                            nearest_idx = time_diff.argmin()
+                            actual_time = source_df.index[int(nearest_idx)]
+                        except Exception:
+                            continue
+
+                        value = source_df.at[actual_time, var_for_annot]
+                        ylow, yhigh = axes[i].get_ylim()
+
+                        display_value = value
+                        va = "bottom"
+                        if value > yhigh:
+                            display_value = yhigh
+                            va = "top"
+                        elif value < ylow:
+                            display_value = ylow
+                            va = "bottom"
+
+                        ha = "left"
+                        axes[i].annotate(
+                            f"{value:.2f}",
+                            xy=(actual_time, display_value),
+                            xytext=(actual_time, display_value),
+                            textcoords="data",
+                            fontsize="small",
+                            color=color,
+                            verticalalignment=va,
+                            horizontalalignment=ha,
+                        )
+
+                        axes[i].axvline(
+                            x=actual_time,
+                            color=color,
+                            linestyle="--",
+                            alpha=0.7,
+                        )
+
+    if axes:
+        axes[-1].set_xlabel("Time (s) from Engine Start + Offset")
+
+    file_info_str = "\n".join(
+        [f"{name}: {fname}" for name, fname in file_names.items()]
+    )
+    fig.suptitle(file_info_str, y=0.93)
+
+    if show_plot:
+        # constrained_layout=True를 사용했으므로 tight_layout은 사용하지 않음
+        # plt.tight_layout(rect=(0, 0, 1, 0.95))
+        plt.show()
+
+    return fig, axes
 
 
 def plot(

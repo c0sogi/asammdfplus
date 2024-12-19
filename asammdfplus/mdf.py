@@ -17,6 +17,8 @@ from typing import (
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 
 from ._original import (
     MDF,
@@ -40,7 +42,7 @@ from ._utils import (
     proxy_function_as_method,
 )
 from .io import combine_as_dataframe, from_dataframe
-from .mda import plot
+from .mda import CSTPlotConfig, plot, plot_cst
 
 logger = logging.getLogger(__name__)
 
@@ -515,6 +517,12 @@ class MDFPlus(MDF):
     #################
     # Staticmethods #
     #################
+
+    @staticmethod
+    def plot_cst(
+        cst_plot_config: CSTPlotConfig,
+    ) -> tuple[Figure, list[Axes]]:
+        return plot_cst(cst_plot_config=cst_plot_config)
 
     @staticmethod
     def signal_to_series(signal: Signal) -> pd.Series:
