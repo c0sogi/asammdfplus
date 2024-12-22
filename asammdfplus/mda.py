@@ -58,7 +58,7 @@ class CSTPlotConfig(TypedDict):
     xlim: Optional[tuple[float, float]]
     legend_location: str
     start_offset: float
-    mdf_dict: dict[str, MDF | str]
+    mdf_dict: dict[str, str]
     color_map: dict[str, str]
     plots_config: dict[str, PlotSettings]
     signal_time_options: Optional[
@@ -191,7 +191,9 @@ def find_engine_starting_points(
     return timestamps
 
 
-def plot_cst(cst_plot_config: CSTPlotConfig) -> tuple[Figure, list[Axes]]:
+def plot_cst(
+    cst_plot_config: CSTPlotConfig,
+) -> tuple[Figure, list[Axes], dict[str, MDF]]:
 
     engine_speed_col = cst_plot_config["engine_speed_col"]
     batt_vol_col = cst_plot_config["batt_vol_col"]
@@ -219,9 +221,11 @@ def plot_cst(cst_plot_config: CSTPlotConfig) -> tuple[Figure, list[Axes]]:
     file_names: dict[str, str] = {}
 
     # MDF -> DataFrame 변환 및 엔진 스타트 포인트 계산
+    _mdf_dict: dict[str, MDF] = {}
     for name, mdf in mdf_dict.items():
         if not isinstance(mdf, MDF):
             mdf = MDF(mdf)
+        _mdf_dict[name] = mdf
         existing_vars = [v for v in needed_vars if v in mdf]
         if not existing_vars:
             # 필요한 변수가 하나도 없는 경우 빈 DataFrame
@@ -230,7 +234,6 @@ def plot_cst(cst_plot_config: CSTPlotConfig) -> tuple[Figure, list[Axes]]:
             df_original = mdf.to_dataframe(existing_vars, raster=raster)
 
         df_original = df_original.sort_index()
-
         start_points: list[tuple[float, float]] = (
             find_engine_starting_points(
                 df_or_mdf=mdf,
@@ -485,7 +488,7 @@ def plot_cst(cst_plot_config: CSTPlotConfig) -> tuple[Figure, list[Axes]]:
         # plt.tight_layout(rect=(0, 0, 1, 0.95))
         plt.show()
 
-    return fig, axes
+    return fig, axes, _mdf_dict
 
 
 def plot(

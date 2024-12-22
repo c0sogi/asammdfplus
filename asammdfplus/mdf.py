@@ -521,8 +521,13 @@ class MDFPlus(MDF):
     @staticmethod
     def plot_cst(
         cst_plot_config: CSTPlotConfig,
-    ) -> tuple[Figure, list[Axes]]:
-        return plot_cst(cst_plot_config=cst_plot_config)
+    ) -> tuple[Figure, list[Axes], dict[str, "MDFPlus"]]:
+        figs, axes, mdf_dict = plot_cst(cst_plot_config=cst_plot_config)
+        mdfplus_dict: dict[str, MDFPlus] = {
+            k: MDFPlus.inherit_from_mdf(self=None, mdf=v)
+            for k, v in mdf_dict.items()
+        }
+        return figs, axes, mdfplus_dict
 
     @staticmethod
     def signal_to_series(signal: Signal) -> pd.Series:
