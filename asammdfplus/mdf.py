@@ -10,6 +10,7 @@ from typing import (
     Optional,
     Self,
     Sequence,
+    cast,
     overload,
     override,
 )
@@ -58,15 +59,11 @@ class MDFPlus(MDF):
     # Magicmethods #
     ################
     def __getitem__(self, key: str) -> pd.Series:
-        matches: set[str] = self.match(
-            pattern=key, case_insensitive=True, include_device=False
-        )
+        matches: set[str] = self.match(pattern=key, case_insensitive=True, include_device=False)
         if not matches:
             raise KeyError(f"Channel {key} not found in MDF.")
         if len(matches) > 1:
-            raise KeyError(
-                f"Multiple channels found for {key}: {', '.join(matches)}"
-            )
+            raise KeyError(f"Multiple channels found for {key}: {', '.join(matches)}")
         return self.signal_to_series(self.get(matches.pop()))
 
     def __setitem__(
@@ -147,11 +144,7 @@ class MDFPlus(MDF):
             "^" + re.escape(pattern).replace("\\*", ".*") + "$",
             flags=re.IGNORECASE if case_insensitive else 0,
         )
-        matches: list[str] = [
-            name
-            for name in self.channel_names
-            if compiled_pattern.search(name)
-        ]
+        matches: list[str] = [name for name in self.channel_names if compiled_pattern.search(name)]
         names: set[str]
         if include_device is None:
             names = set(matches)
@@ -186,6 +179,7 @@ class MDFPlus(MDF):
         interpolate_outwards_with_nan: bool = False,
         numeric_1D_only: bool = False,
         progress=None,
+        use_polars: bool = False,
     ) -> pd.DataFrame:
         df: pd.DataFrame
         cached_signals: dict[str, Signal]
@@ -193,9 +187,7 @@ class MDFPlus(MDF):
         if channels is not None:
             # If there are channels to be constrained, first hijack the cached signals
             # and get the non-cached channels
-            cached_signals, non_cached_channels = hijack_channels(
-                self, channels
-            )
+            cached_signals, non_cached_channels = hijack_channels(self, channels)
         else:
             # If there are no channels to be constrained, just use the all signals
             cached_signals = self.__cache__
@@ -219,6 +211,7 @@ class MDFPlus(MDF):
                 interpolate_outwards_with_nan=interpolate_outwards_with_nan,
                 numeric_1D_only=numeric_1D_only,
                 progress=progress,
+                use_polars=use_polars,
             )
             # Interpolate the cached signals to the timestamps of the non-cached channels
             if cached_signals:
@@ -241,11 +234,7 @@ class MDFPlus(MDF):
                     raster = self.master_using_raster(raster)
                 master = raster
             else:
-                masters = {
-                    index: self.get_master(index)
-                    for index in self.virtual_groups
-                }
-
+                masters = {index: self.get_master(index) for index in self.virtual_groups}
                 if masters:
                     master = reduce(np.union1d, masters.values())
                 else:
@@ -325,7 +314,7 @@ class MDFPlus(MDF):
         group: int | None = None,
         index: int | None = None,
         raster: RasterType | None = None,
-        data: bytes | None = None,
+        data: bytes | tuple[bytes, int, int | None] | None = None,
         raw: bool = False,
         ignore_invalidation_bits: bool = False,
         record_offset: int = 0,
@@ -338,18 +327,37 @@ class MDFPlus(MDF):
         if name in self.__cache__:
             return self.__cache__[name]
         else:
-            signal: Signal = self._mdf.get(
-                name=name,
-                group=group,
-                index=index,
-                raster=raster,
-                data=data,
-                raw=raw,
-                ignore_invalidation_bits=ignore_invalidation_bits,
-                record_offset=record_offset,
-                record_count=record_count,
-                skip_channel_validation=skip_channel_validation,
-            )
+            if isinstance(self._mdf, MDF3):
+                data = cast(tuple[bytes, int, int | None] | None, data)
+                signal: Signal = self._mdf.get(
+                    name=name,
+                    group=group,
+                    index=index,
+                    raster=raster,
+                    data=data,
+                    raw=raw,
+                    ignore_invalidation_bits=ignore_invalidation_bits,
+                    record_offset=record_offset,
+                    record_count=record_count,
+                    skip_channel_validation=skip_channel_validation,
+                )
+            elif isinstance(self._mdf, MDF4):
+                data = cast(bytes | None, data)
+                signal: Signal = self._mdf.get(
+                    name=name,
+                    group=group,
+                    index=index,
+                    raster=raster,
+                    data=data,
+                    raw=raw,
+                    ignore_invalidation_bits=ignore_invalidation_bits,
+                    record_offset=record_offset,
+                    record_count=record_count,
+                    skip_channel_validation=skip_channel_validation,
+                )
+            else:
+                raise TypeError(f"Unsupported MDF version: {type(self._mdf)}")
+
             if name:
                 self.__cache__[name] = signal
             return signal
@@ -364,9 +372,7 @@ class MDFPlus(MDF):
         copy_master: bool = True,
         raw: bool | dict[str, bool] = False,
     ) -> Iterator[Signal]:
-        for signal in super().iter_channels(
-            skip_master=skip_master, copy_master=copy_master, raw=raw
-        ):
+        for signal in super().iter_channels(skip_master=skip_master, copy_master=copy_master, raw=raw):
             yield self.__cache__.get(signal.name, signal)
 
     @override
@@ -380,9 +386,7 @@ class MDFPlus(MDF):
         record_count: int | None = None,
         validate: bool = False,
     ) -> list[Signal]:
-        hijacked_signals, non_hijacked_channels = hijack_channels(
-            self, channels
-        )
+        hijacked_signals, non_hijacked_channels = hijack_channels(self, channels)
         return super().select(
             channels=non_hijacked_channels,
             record_offset=record_offset,
@@ -442,17 +446,13 @@ class MDFPlus(MDF):
             comment=comment,
         )
 
-    def try_get_signal(
-        self, signal_name: str, notify_if_not_exists: bool = False
-    ) -> Signal | None:
+    def try_get_signal(self, signal_name: str, notify_if_not_exists: bool = False) -> Signal | None:
         """Try to get a signal from the MDF file. If the signal does not exist, return None."""
         try:
             return self.get(signal_name)
         except Exception:
             if notify_if_not_exists:
-                logger.error(
-                    f"Signal {signal_name} does not exist in the MDF file."
-                )
+                logger.error(f"Signal {signal_name} does not exist in the MDF file.")
             return None
 
     ##############
@@ -467,22 +467,16 @@ class MDFPlus(MDF):
 
     @property
     def channel_names_with_device(self) -> set[str]:
-        return get_channel_names_with_device(
-            self.channels_db.keys(), self.__cache__.keys()
-        )
+        return get_channel_names_with_device(self.channels_db.keys(), self.__cache__.keys())
 
     @property
     def channel_names_without_device(self) -> set[str]:
-        return get_channel_names_without_device(
-            self.channels_db.keys(), self.__cache__.keys()
-        )
+        return get_channel_names_without_device(self.channels_db.keys(), self.__cache__.keys())
 
     @property
     def startend(self) -> tuple[float, float]:
         """Get the start and end timestamps of the MDF file."""
-        sig = next(
-            sig for sig in self.iter_channels() if sig.timestamps.size > 0
-        )
+        sig = next(sig for sig in self.iter_channels() if sig.timestamps.size > 0)
         return float(sig.timestamps[0]), float(sig.timestamps[-1])
 
     @cached_property
@@ -523,10 +517,7 @@ class MDFPlus(MDF):
         cst_plot_config: CSTPlotConfig,
     ) -> tuple[Figure, list[Axes], dict[str, "MDFPlus"]]:
         figs, axes, mdf_dict = plot_cst(cst_plot_config=cst_plot_config)
-        mdfplus_dict: dict[str, MDFPlus] = {
-            k: MDFPlus.inherit_from_mdf(self=None, mdf=v)
-            for k, v in mdf_dict.items()
-        }
+        mdfplus_dict: dict[str, MDFPlus] = {k: MDFPlus.inherit_from_mdf(self=None, mdf=v) for k, v in mdf_dict.items()}
         return figs, axes, mdfplus_dict
 
     @staticmethod
@@ -548,9 +539,7 @@ class MDFPlus(MDF):
         )
 
     @staticmethod
-    def cut_signal(
-        signal: Signal, intervals: list[tuple[float, float]]
-    ) -> list[Signal]:
+    def cut_signal(signal: Signal, intervals: list[tuple[float, float]]) -> list[Signal]:
         """Cut the signal into intervals.
         The intervals are a list of tuples, where each tuple is a start and end point.
         The start and end points are in seconds.
@@ -607,40 +596,26 @@ class MDFPlus(MDF):
             # 위치 기반 인덱스 사용
             positions = range(len(mask))
             mask_pos = pd.Series(mask.values, index=positions, dtype=bool)
-            edge_fall = mask_pos[
-                (~mask_pos) & mask_pos.shift(1, fill_value=mask_pos.iloc[0])
-            ].index
-            edge_rise = mask_pos[
-                mask_pos & ~mask_pos.shift(1, fill_value=mask_pos.iloc[0])
-            ].index
+            edge_fall = mask_pos[(~mask_pos) & mask_pos.shift(1, fill_value=mask_pos.iloc[0])].index
+            edge_rise = mask_pos[mask_pos & ~mask_pos.shift(1, fill_value=mask_pos.iloc[0])].index
             if mask_pos.iloc[0]:
                 edge_rise = pd.Index([0]).append(edge_rise)
             if mask_pos.iloc[-1]:
                 edge_fall = edge_fall.append(pd.Index([len(mask) - 1]))
             if not edge_rise.empty and not edge_fall.empty:
-                return [
-                    (s, e) for s, e in zip(edge_rise, edge_fall) if s < e
-                ]
+                return [(s, e) for s, e in zip(edge_rise, edge_fall) if s < e]
             return []
         else:
             # 타임스탬프 기반 인덱스 사용
-            edge_fall = mask[
-                ~mask & mask.shift(1, fill_value=mask.iloc[0])
-            ].index.astype(float)
-            edge_rise = mask[
-                mask & ~mask.shift(1, fill_value=mask.iloc[0])
-            ].index.astype(float)
-            mask_idx: npt.NDArray[np.float64] = mask.index.to_numpy(
-                dtype=np.float64
-            ).ravel()
+            edge_fall = mask[~mask & mask.shift(1, fill_value=mask.iloc[0])].index.astype(float)
+            edge_rise = mask[mask & ~mask.shift(1, fill_value=mask.iloc[0])].index.astype(float)
+            mask_idx: npt.NDArray[np.float64] = mask.index.to_numpy(dtype=np.float64).ravel()
             if mask.iloc[0]:
                 edge_rise = edge_rise.insert(0, float(mask_idx[0]))
             if mask.iloc[-1]:
                 edge_fall = edge_fall.append(pd.Index([float(mask_idx[-1])]))
             if not edge_rise.empty and not edge_fall.empty:
-                return [
-                    (s, e) for s, e in zip(edge_rise, edge_fall) if s < e
-                ]
+                return [(s, e) for s, e in zip(edge_rise, edge_fall) if s < e]
             return []
 
     @staticmethod
@@ -659,9 +634,7 @@ class MDFPlus(MDF):
         """
         # 입력값 타입 검증
         if not isinstance(lab_content, str):
-            raise ValueError(
-                f"LAB 파일 내용이 문자열이 아닙니다: {lab_content}"
-            )
+            raise ValueError(f"LAB 파일 내용이 문자열이 아닙니다: {lab_content}")
         ramcell_section: set[str] = set()
         reading_ramcell: bool = False
 
@@ -680,16 +653,12 @@ class MDFPlus(MDF):
 
             # RAMCELL 변수 처리
             if reading_ramcell and line:
-                variable_name: str = line.split(";")[
-                    0
-                ]  # 세미콜론으로 분리하여 변수명만 추출
+                variable_name: str = line.split(";")[0]  # 세미콜론으로 분리하여 변수명만 추출
                 ramcell_section.add(variable_name)
 
         # RAMCELL 섹션이 없거나 비어있는 경우
         if not ramcell_section:
-            raise ValueError(
-                "LAB 파일에서 RAMCELL 섹션을 찾을 수 없거나 비어있습니다"
-            )
+            raise ValueError("LAB 파일에서 RAMCELL 섹션을 찾을 수 없거나 비어있습니다")
 
         return ramcell_section
 
@@ -792,9 +761,7 @@ class MDFPlus(MDF):
 
     @override
     def convert(self, version: str, progress=None) -> "MDFPlus":
-        new = self.inherit_from_mdf(
-            super().convert(version=version, progress=progress)
-        )
+        new = self.inherit_from_mdf(super().convert(version=version, progress=progress))
         new.name = self.name
         return new
 

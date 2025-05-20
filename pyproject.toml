@@ -1,22 +1,11 @@
-[tool.poetry]
+[project]
 name = "asammdfplus"
-version = "8.0.2"
+version = "8.2.0"
 description = "A wrapper for asammdf with additional features"
-authors = ["c0sogi <dcas@naver.com>"]
 license = "MIT"
 readme = "README.md"
-packages = [{ include = "asammdfplus" }]
+dependencies = ["asammdf >=8.2, <8.3", "numpy", "pandas", "matplotlib"]
 
-[tool.poetry.dependencies]
-python = ">=3.10"
-asammdf = ">=8.0.0,<8.1.0"
-numpy = ">=1.20.0,<3"
-pandas = ">=1.5.0,<3"
-matplotlib = ">=3.0.0,<4"
-
-[tool.poetry.group.dev.dependencies]
-ruff = "^0.8.0"
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["asammdfplus", "asammdfplus.*"]
